@@ -14,12 +14,14 @@ import kornia.geometry
 import pyqtgraph.opengl as gl
 import time
 
+from collections import namedtuple
+
 try:
-    sys.path.append(os.path.expanduser(
-        '~/Repos/Experiments/PhoneBot/control/'))
-    from core.vis.viewer.proxy_commands import AddPlotCommand, AddLinesCommand
-    from core.vis.viewer.proxy_command import ProxyCommand
-    from core.vis.viewer import ProxyViewer
+    # sys.path.append(os.path.expanduser(
+        # '~/Repos/Experiments/PhoneBot/control/'))
+    from phonebot.core.vis.viewer.proxy_commands import AddPlotCommand, AddLinesCommand
+    from phonebot.core.vis.viewer.proxy_command import ProxyCommand
+    from phonebot.core.vis.viewer import ProxyViewer
 except ImportError:
     print('sad')
 
@@ -50,13 +52,30 @@ class AddPointsCommand(ProxyCommand):
         viewer.widget_.addItem(item)
 
 
-def rotation_matrix_2d(angle):
-    c, s = np.cos(angle), np.sin(angle)
-    return np.asarray([[c, -s], [s, c]])
+def cube_signs():
+    return np.asarray([(1, -1, 1),
+                       (1, -1, -1),
+                       (1, 1, -1),
+                       (1, 1, 1),
+                       (-1, -1, 1),
+                       (-1, -1, -1),
+                       (-1, 1, -1),
+                       (-1, 1, 1)], dtype=np.int32)
 
 
-def rotate_vector(v, axis, origin, angle):
-    pass
+def cube_indices():
+    return np.asarray([(4, 0, 3),
+                       (4, 3, 7),
+                       (0, 1, 2),
+                       (0, 2, 3),
+                       (1, 5, 6),
+                       (1, 6, 2),
+                       (5, 4, 7),
+                       (5, 7, 6),
+                       (7, 3, 2),
+                       (7, 2, 6),
+                       (0, 5, 1),
+                       (0, 4, 5)], dtype=np.int32)
 
 
 class Config(object):
@@ -74,18 +93,20 @@ class Config(object):
         self.lim = np.asarray(
             [self.xlim, self.ylim, self.zlim]).astype(np.float32)  # 3x2
         self.min_num_objects = 1
-        self.max_num_objects = 8
+        self.max_num_objects = 64
         self.max_gen_iterations = 128
         self.dim_lim = np.asarray([
             [0.5, 3.0],
             [1.5, 4.5],
             [1.0, 2.0]], dtype=np.float32)
         self.vmax = 18.0  # m/s
-        self.wmax = 0.5  # rad/s
+        self.wmax = 2.0  # rad/s
         self.ray_z = 2.0
         self.max_ray_distance = 100.0
-
+        # Compute configuration.
+        self.use_gpu = True
         self.finalize()  # Compute cache for derived parameters.
+        self.convert()  # Convert quantities to values.
 
     def finalize(self):
         v_fov, h_fov = self.fov
@@ -96,7 +117,6 @@ class Config(object):
         # Bins -> Grid
         self.grid = np.stack(np.meshgrid(
             self.v_ang, self.h_ang, indexing='ij'), axis=-1)
-        print('gs', self.grid.shape)
         self.v_grid, self.h_grid = [self.grid[..., i] for i in range(2)]
         # Grid -> Rays
         v_cos, v_sin = np.cos(self.v_grid), np.sin(self.v_grid)
@@ -106,8 +126,28 @@ class Config(object):
         # Build Approximate timestamp offsets (mostly experimental)
         stamps = (1.0 / self.fps) * (self.h_grid / (2*np.pi))
         stamps -= stamps.min()  # start from offset=0, somewhat arbitrarily.
-        print('ss', stamps.shape)
-        self.stamps = stamps
+
+        self.stamps = stamps.astype(np.float32)
+
+        self.use_gpu = self.use_gpu and tr.cuda.is_available()
+
+    def convert(self):
+        device = tr.device('cuda:0' if self.use_gpu else 'cpu')
+        self.device = device
+
+        pos_lim = np.float32([self.xlim, self.ylim, [-np.pi, np.pi]])
+        vel_lim = np.float32([[0.0, self.vmax], [0.0, self.wmax]])
+
+        d = dict(
+            dim_lim=tr.from_numpy(self.dim_lim).to(device),
+            pos_lim=tr.from_numpy(pos_lim).to(device),
+            vel_lim=tr.from_numpy(vel_lim).to(device),
+            rays=tr.from_numpy(self.rays).to(device),
+            stamps=tr.from_numpy(self.stamps).to(device),
+            cube_signs=tr.from_numpy(cube_signs()).to(device),
+            cube_indices=tr.from_numpy(cube_indices()).long().to(device),
+        )
+        self.values = namedtuple('Values', sorted(d))(**d)
 
 
 def get_bounding_box(dim, pose):
@@ -172,18 +212,18 @@ def create_config() -> Config:
 def create_vehicle(num=(), config: Config = Config()):
     # Create distributions.
     dim_dist = tr.distributions.Uniform(
-        tr.from_numpy(config.dim_lim[:, 0]).cuda(),
-        tr.from_numpy(config.dim_lim[:, 1]).cuda()
-        )
+        config.values.dim_lim[:, 0],
+        config.values.dim_lim[:, 1]
+    )
 
     pos_dist = tr.distributions.Uniform(
-        tr.tensor([config.xlim[0], config.ylim[0], -np.pi]).cuda(),
-        tr.tensor([config.xlim[1], config.ylim[1], np.pi]).cuda()
-        )
+        config.values.pos_lim[:, 0],
+        config.values.pos_lim[:, 1]
+    )
 
     vel_dist = tr.distributions.Uniform(
-        tr.tensor([0.0, 0.0]).cuda(),
-        tr.tensor([config.vmax, config.wmax]).cuda()
+        config.values.vel_lim[:, 0],
+        config.values.vel_lim[:, 1]
     )
 
     # Generate vehicle from configured distributions.
@@ -214,9 +254,9 @@ def create_scene(config: Config):
     gvel = (0.0, 0.0, 0.0)
 
     # Append ground.
-    dim = tr.cat((dim, tr.tensor(gdim).view(1, 3)), 0)
-    pos = tr.cat((pos, tr.tensor(gpos).view(1, 3)), 0)
-    vel = tr.cat((vel, tr.tensor(gvel).view(1, 3)), 0)
+    dim = tr.cat((dim, tr.tensor(gdim).to(config.device).view(1, 3)), 0)
+    pos = tr.cat((pos, tr.tensor(gpos).to(config.device).view(1, 3)), 0)
+    vel = tr.cat((vel, tr.tensor(gvel).to(config.device).view(1, 3)), 0)
 
     return [dim, pos], vel
 
@@ -263,10 +303,13 @@ def create_rays(pose: tr.Tensor, velocity: tr.Tensor, stamp: tr.Tensor, config: 
     # NOTE(yycho0108): Currently ray transform is coincident to vehicle transform.
     # Consider applying offsets here instead ?
     ray_pose = pose[None, None, :] + \
-        velocity[None, None, :] * tr.from_numpy(config.stamps[..., None]).cuda()
+        velocity[None, None, :] * \
+        config.values.stamps[..., None]
+
     # Convert 2D (x,y) -> 3D (x,y,z) Ray origin
-    ray_origin = tr.cat((ray_pose[...,:2], tr.tensor(config.ray_z).view(1,1).float()), -1)
-    
+    ray_z = tr.full_like(ray_pose[..., 2:], config.ray_z)
+    ray_origin = tr.cat((ray_pose[..., :2], ray_z), -1)
+
     # ray_origin = np.insert(ray_pose[..., :2], 2, config.ray_z, axis=-1)
 
     # Rotate vector according to pose
@@ -275,19 +318,17 @@ def create_rays(pose: tr.Tensor, velocity: tr.Tensor, stamp: tr.Tensor, config: 
     #rvec[..., :2] = 0
     #r = R.from_rotvec(rvec.reshape(-1, 3))
     #ray_direction = r.apply(config.rays.reshape(-1, 3))
+
     rvec = tr.zeros_like(ray_pose)
     rvec[..., 2] = ray_pose[..., 2]
     rmat = kornia.angle_axis_to_rotation_matrix(rvec.view(-1, 3)).view(
         ray_pose.shape[:-1] + (3, 3)).float()
-    # rmat = random_rotation_matrix(ray_pose.shape[:2])
-    rays_0 = tr.from_numpy(config.rays)
-    ray_dirs = tr.einsum('...ab,...b->...a', rmat, rays_0)
+    ray_dirs = tr.einsum('...ab,...b->...a', rmat, config.values.rays)
     ray_dirs = ray_dirs.view(config.rays.shape)
-    # ray_direction = ray_direction.reshape(config.rays.shape)
 
     # Format output and return.
     rays = (ray_origin, ray_dirs)
-    return (rays, tr.from_numpy(config.stamps) + stamp)
+    return (rays, config.values.stamps + stamp)
 
 
 def get_axes(h):
@@ -302,44 +343,14 @@ def get_axes(h):
     return axes
 
 
-def cube_signs():
-    return np.asarray([(1, -1, 1),
-                       (1, -1, -1),
-                       (1, 1, -1),
-                       (1, 1, 1),
-                       (-1, -1, 1),
-                       (-1, -1, -1),
-                       (-1, 1, -1),
-                       (-1, 1, 1)], dtype=np.int32)
-
-
-def cube_indices():
-    return np.asarray([(4, 0, 3),
-                       (4, 3, 7),
-                       (0, 1, 2),
-                       (0, 2, 3),
-                       (1, 5, 6),
-                       (1, 6, 2),
-                       (5, 4, 7),
-                       (5, 7, 6),
-                       (7, 3, 2),
-                       (7, 2, 6),
-                       (0, 5, 1),
-                       (0, 4, 5)], dtype=np.int32)
-
-
 def get_vertices(dim: tr.Tensor, poses: tr.Tensor, config: Config):
-    # Cache input shapes.
-    ds = dim.shape
-    ps = poses.shape
-
     # Create canonial bounding box from dimensions.
-    bbox = 0.5 * dim[:, None] * tr.from_numpy(cube_signs())[None, :]
+    bbox = 0.5 * dim[:, None] * config.values.cube_signs[None, :]
     # bbox -> O83
 
     # Extract transform from pose.
     poses = poses.view((-1,) + poses.shape[-2:])  # -> (R, O, 3)
-    rvec = tr.tensor([0, 0, 1]).view(1, 1, 3) * poses
+    rvec = tr.tensor([0, 0, 1]).to(config.device).view(1, 1, 3) * poses
     rmat = kornia.angle_axis_to_rotation_matrix(
         rvec.view(-1, 3)).view(poses.shape[:-1] + (3, 3))
     # rmat -> (RO33)
@@ -350,8 +361,7 @@ def get_vertices(dim: tr.Tensor, poses: tr.Tensor, config: Config):
     bbox[..., 2] += 0.5*dim[None, :, None, 2]  # lift bbox up (s.t. zmin=0)
 
     # Extract triangles from cube.
-    indices = tr.from_numpy(cube_indices())
-    vertices = bbox[:, :, indices.long()]  # (R,O,12,3,3)
+    vertices = bbox[:, :, config.values.cube_indices]  # (R,O,12,3,3)
     return vertices
 
 
@@ -384,9 +394,6 @@ def raytrace(rays, stamps, scene, config):
 def apply_pose(cloud, stamp, stamps, pose, velocity, config: Config):
     # Extract transforms.
     dt = stamps - stamp
-    print(F"ps:{pose.shape}")
-    print(F"vs:{velocity.shape}")
-    print(F"dt:{dt.shape}")
     pose_at_stamp = pose[None, None, :] + \
         dt[..., None] * velocity[None, None, :]
 
@@ -397,7 +404,6 @@ def apply_pose(cloud, stamp, stamps, pose, velocity, config: Config):
         rvec.view(-1, 3)).view(rvec.shape[:-1]+(3, 3)).float()
 
     # Apply transforms.
-    print(rmat.shape, cloud.shape)
     cloud = tr.einsum('...ab,...b->...a', rmat, cloud)
     cloud[..., :2] += pose[..., :2]
     cloud[..., 2] += config.ray_z
@@ -405,15 +411,12 @@ def apply_pose(cloud, stamp, stamps, pose, velocity, config: Config):
 
 
 def main():
-    tr.set_default_tensor_type('torch.cuda.FloatTensor')
-
+    # Generate scene from config.
     config = create_config()
     scene = create_scene(config)
     (dim, pose), velocity = create_vehicle((), config)
 
-    # Zero out pose for debugging purposes
-    # pose *= 0.0
-
+    # Initialize Viewer.
     data_queue, event_queue, command_queue = ProxyViewer.create()
     command_queue.put(AddGridCommand(
         name='grid', size=(400, 400, 1), spacing=(10, 10, 10)))
@@ -422,24 +425,28 @@ def main():
     command_queue.put(AddPointsCommand(name='self'))
 
     while True:
+        if not event_queue.empty():
+            key = event_queue.get_nowait()
+            if(key == ord('Q')):
+                break
         rays, stamps = create_rays(pose, velocity, 0.0, config)
         hits, dists = raytrace(rays, stamps, scene, config)
         range_image = tr.where(hits, dists, tr.full_like(dists, float('inf')))
         range_image = tr.min(range_image, dim=-1).values
-        rim = range_image.numpy()
 
-        cloud = tr.from_numpy(config.rays) * range_image[..., None]
+        cloud = config.values.rays * range_image[..., None]
         cloud = apply_pose(cloud, 0.0, stamps, pose, velocity, config)
-        cloud = cloud.numpy().reshape(-1, 3)
+        cloud = cloud.cpu().numpy().reshape(-1, 3)
 
         obstacle_vertices = get_vertices(*scene[0], config).reshape(-1, 3, 3)
-        obstacle_vertices = obstacle_vertices.numpy()
+        obstacle_vertices = obstacle_vertices.cpu().numpy()
         lines = obstacle_vertices[:, [
             (0, 1), (1, 2), (2, 0)], :].reshape(-1, 2, 3)
 
-        vpos = pose[..., :2].numpy()
+        vpos = pose[..., :2].cpu().numpy()
         vpos = np.asarray([[vpos[0], vpos[1], config.ray_z]])
 
+        # Send data for visualization.
         data_queue.put(dict(
             cloud=dict(pos=cloud.reshape(-1, 3)),
             obstacles=dict(pos=lines),
@@ -449,32 +456,7 @@ def main():
         # Apply velocity
         pose += velocity * config.win
         scene[0][1] += scene[1] * config.win
-
-        time.sleep(0.001)
-
-    #ax = plt.gca(projection='3d')
-    #ax.plot([vpos[0]], [vpos[1]], [0], 'ko')
-    #ax.plot(cloud[..., 0], cloud[..., 1], cloud[..., 2], 'r+')
-
-    ##corners = get_bounding_box(*scene[0]).numpy()
-    # for c in corners:
-    ##    ax.plot(c[..., 0], c[..., 1], 0*c[..., 1] - config.ray_z, 'b--')
-
-    # obstacle_vertices = get_vertices(*scene[0], config).reshape(-1, 3, 3)
-    #obstacle_vertices = obstacle_vertices.numpy()
-    #lines = obstacle_vertices[:, [(0, 1), (1, 2), (2, 0)], :].reshape(-1, 2, 3)
-    # print(lines.shape)
-    #lc = Line3DCollection(lines)
-
-    # ax.add_collection(lc)
-
-    print(F"${obstacle_vertices.shape}")
-
-    # plt.axis('equal')
-    # plt.grid()
-
-    # plt.imshow(1.0/rim)
-    # plt.show()
+        # time.sleep(0.001)
 
 
 if __name__ == '__main__':
